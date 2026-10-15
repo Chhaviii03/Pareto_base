@@ -1,0 +1,150 @@
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+# rware registers its Gymnasium env ids on package import (not at pip install time).
+import rware  # noqa: F401
+
+
+def _resolve_rware_env_id(n_agents: int) -> str:
+    # rware>=2.0 registers Gymnasium ids with suffix -v2 (not -v1).
+    if n_agents == 2:
+        return "rware-tiny-2ag-v2"
+    return "rware-tiny-4ag-v2"
+
+
+class RWAREWrapper:
+    """
+    Adapter used by train.py/baselines.py.
+
+    Exposes:
+      - reset() -> list(obs_i)
+      - step(actions, gate_vals=None) -> (next_obs, [task_reward, comm_reward], done, info)
+      - obs_dim, n_actions attributes
+      - _env attribute for baseline random-action sampling
+    """
+
+    def __init__(self, n_agents=4, max_steps=500, render_mode=None, env_id=None):
+        del max_steps  # RWARE id config controls episode length in this project.
+        self.n_agents = n_agents
+        env_id = env_id or _resolve_rware_env_id(n_agents)
+
+        try:
+            self._env = gym.make(env_id, render_mode=render_mode)
+        except (gym.error.NameNotFound, gym.error.UnregisteredEnv):
+            # Prefer v2 (rware 2.x), then v1/v0 for older installs.
+            na = n_agents
+            possible_ids = [
+                f"rware-tiny-{na}ag-v2",
+                f"rware-small-{na}ag-v2",
+                f"rware-tiny-{na}ag-v1",
+                f"rware-tiny-{na}ag-v0",
+                f"rware-small-{na}ag-v1",
+                f"rware-small-{na}ag-v0",
+                "rware-tiny-4ag-v2",
+                "rware-tiny-4ag-v1",
+                "rware-tiny-2ag-v2",
+                "rware-tiny-2ag-v1",
+                "RWARE-v0",
+                "rware-v0",
+            ]
+            # Dedupe while preserving order
+            seen = set()
+            possible_ids = [x for x in possible_ids if not (x in seen or seen.add(x))]
+            for eid in possible_ids:
+                try:
+                    self._env = gym.make(eid, render_mode=render_mode)
+                    env_id = eid
+                    break
+                except (gym.error.NameNotFound, gym.error.UnregisteredEnv):
+                    continue
+            else:
+                raise ImportError(
+                    "Could not create RWARE environment. Install/register `rware` first. "
+                    "Try: pip install rware"
+                )
+
+        self.env_id = env_id
+        self.observation_space = self._env.observation_space
+        self.action_space = self._env.action_space
+        self.obs_dim = self._infer_obs_dim(self.observation_space)
+        self.n_actions = self._infer_n_actions(self.action_space)
+
+    @staticmethod
+    def _infer_obs_dim(obs_space):
+        if isinstance(obs_space, spaces.Tuple) and len(obs_space.spaces) > 0:
+            first = obs_space.spaces[0]
+            if hasattr(first, "shape") and first.shape:
+                return int(first.shape[0])
+        if hasattr(obs_space, "shape") and obs_space.shape:
+            return int(obs_space.shape[0])
+        return 0
+
+    @staticmethod
+    def _infer_n_actions(act_space):
+        if isinstance(act_space, spaces.Tuple) and len(act_space.spaces) > 0:
+            first = act_space.spaces[0]
+            if isinstance(first, spaces.Discrete):
+                return int(first.n)
+        if isinstance(act_space, spaces.Discrete):
+            return int(act_space.n)
+        if isinstance(act_space, spaces.MultiDiscrete):
+            return int(act_space.nvec[0])
+        return 0
+
+    def reset(self, seed=None, options=None):
+        out = self._env.reset(seed=seed, options=options)
+        if isinstance(out, tuple) and len(out) == 2:
+            obs, _info = out
+        else:
+            obs = out
+        return list(obs)
+
+    def step(self, actions, gate_vals=None):
+        out = self._env.step(actions)
+        if len(out) == 5:
+            next_obs, reward, terminated, truncated, info = out
+            done = bool(terminated or truncated)
+        else:
+            next_obs, reward, done, info = out
+
+        if isinstance(reward, (list, tuple, np.ndarray)):
+            task_reward = float(np.sum(np.asarray(reward, dtype=np.float32)))
+        else:
+            task_reward = float(reward)
+
+        if gate_vals is None:
+            comm_reward = 0.0
+        else:
+            comm_reward = -float(np.sum(np.asarray(gate_vals, dtype=np.float32)))
+
+        r_vec = np.array([task_reward, comm_reward], dtype=np.float32)
+        return list(next_obs), r_vec, done, info
+
+    def close(self):
+        self._env.close()
+
+
+def make_env(env_name="rware", n_agents=4, max_steps=500, render_mode=None):
+    if env_name.lower() != "rware":
+        raise ValueError(f"Unsupported env '{env_name}'. Only 'rware' is supported.")
+    return RWAREWrapper(
+        n_agents=n_agents,
+        max_steps=max_steps,
+        render_mode=render_mode,
+    )
+
+
+if __name__ == "__main__":
+    print("Testing RWARE wrapper...")
+    env = make_env("rware", n_agents=4)
+    obs = env.reset()
+    print(f"  n_agents  = {len(obs)}")
+    print(f"  obs_dim   = {env.obs_dim}")
+    print(f"  n_actions = {env.n_actions}")
+
+    actions = [env._env.action_space[i].sample() for i in range(len(obs))]
+    gates = np.ones(len(obs), dtype=np.float32)
+    _obs, reward, done, _info = env.step(actions, gates)
+    print(f"  reward vec = {reward.tolist()}  done={done}")
+    print("  Step completed successfully.")

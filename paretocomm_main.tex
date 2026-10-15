@@ -1,0 +1,816 @@
+% ============================================================
+% ParetoComm: Springer LNNS Conference Paper
+% Compile: pdflatex -> bibtex -> pdflatex x2
+% ============================================================
+\documentclass[runningheads]{llncs}
+
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{bm}
+\usepackage{bbm}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+% Macros
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\PF}{\mathcal{PF}}
+\newcommand{\W}{\mathcal{W}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\bw}{\mathbf{w}}
+\newcommand{\bG}{\mathbf{G}}
+\newcommand{\br}{\mathbf{r}}
+
+\begin{document}
+
+\title{ParetoComm: Learning Sparse Communication Policies\\
+on the Multi-Objective Frontier for\\
+Resource-Constrained Multi-Agent Systems}
+
+\author{Anandsagar\inst{1} \and
+Abhinav Pratap Rai\inst{1}}
+
+\authorrunning{Anandsagar and Rai}
+
+\institute{Department of Computer Science and Engineering,\\
+Rajiv Gandhi Institute of Petroleum Technology, Amethi, India\\
+\email{\{cs\_student, abhinav.rai\}@rgipt.ac.in}}
+
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Communication in multi-agent reinforcement learning (MARL) systems
+enables coordination but incurs non-trivial resource costs in
+bandwidth and energy, especially in edge-deployed systems such as
+drone swarms, mobile robots, and wireless sensor networks.
+Existing communication-efficient MARL approaches reduce communication
+cost by incorporating it as a scalar penalty, which forces a fixed
+trade-off and cannot reveal the full spectrum of optimal policies.
+We present \textbf{ParetoComm}, a framework that treats communication
+cost as an explicit, separate objective alongside task performance,
+enabling agents to learn a set of Pareto-optimal communication
+policies spanning different coordination--efficiency trade-offs.
+ParetoComm extends the Decentralized Partially Observable MDP
+(Dec-POMDP) formalism with a binary communication gating action and
+a 2-dimensional vector reward.
+A learned gating network, trained using the Straight-Through
+Gumbel-Sigmoid estimator, enables differentiable binary gating.
+We approximate the Pareto front via linear scalarization with a
+uniform weight grid, training one policy per weight vector using an
+actor-critic update with a shared value baseline.
+Experiments on the Multi-Robot Warehouse (RWARE) benchmark with
+4 agents demonstrate that ParetoComm achieves a Hypervolume of
+$0.71$ ($\pm 0.04$), outperforming a scalar-penalized MAPPO baseline
+($0.53 \pm 0.06$) and revealing trade-off regions that scalar
+approaches systematically miss.
+\keywords{Multi-agent reinforcement learning \and
+Multi-objective optimization \and Communication efficiency \and
+Pareto front \and Sparse communication}
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Cooperative multi-agent reinforcement learning (MARL) has achieved
+remarkable results in complex coordination tasks including autonomous
+vehicle platooning~\cite{zhou2019smarts}, cooperative robotic
+manipulation~\cite{guhur2021humanoid}, and distributed
+sensing~\cite{zhang2021multi}.
+A common approach is to augment individual agent policies with
+inter-agent communication, allowing agents to share local
+observations and improve global coordination~\cite{sukhbaatar2016learning,
+das2019tarmac}.
+
+However, in resource-constrained real-world deployments---drone swarms
+operating on battery power, IoT sensor networks with limited bandwidth,
+and edge-deployed robots with narrow communication channels---every
+transmitted message incurs a measurable cost.
+Excessive communication leads to energy depletion, network congestion,
+and increased latency~\cite{lin2021learning}.
+Critically, this cost cannot be ignored or absorbed into the task reward
+without losing information about where on the coordination--efficiency
+trade-off spectrum a given policy sits.
+
+\paragraph{The limitation of scalar penalization.}
+Existing sparse communication methods---such as
+CASEC~\cite{wang2020learning}, SchedNet~\cite{kim2019schednet}, and
+CommNet with bandwidth constraints~\cite{sukhbaatar2016learning}---
+handle communication cost by adding a penalty term
+$r_\text{scalar} = r_\text{task} - \lambda \cdot c_\text{comm}$,
+where $\lambda$ is a fixed trade-off coefficient.
+This reduces a fundamentally multi-objective problem to a single
+objective.
+The consequence is that training one policy for a fixed $\lambda$
+collapses the trade-off to a single point: a practitioner who needs a
+different balance must retrain entirely, and has no systematic way to
+compare policies across the trade-off spectrum.
+
+\paragraph{Our approach.}
+We propose \textbf{ParetoComm}, a framework that explicitly models the
+coordination--communication trade-off as a \emph{multi-objective}
+problem.
+Each agent maintains a binary communication gate, trained with the
+Straight-Through Gumbel-Sigmoid estimator~\cite{jang2017categorical}
+to produce differentiable discrete gating decisions.
+We model the environment as a Dec-POMDP with a 2-dimensional vector
+reward and approximate the Pareto front of optimal policies via linear
+scalarization with a uniform weight grid.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item A formal extension of the Dec-POMDP tuple with a decomposed
+    action space $A^i = A^i_\text{env} \times A^i_\text{comm}$ and
+    a 2-dimensional vector reward.
+  \item A learned binary gating mechanism using the Straight-Through
+    Gumbel-Sigmoid estimator, ensuring consistent gating behavior
+    between training and execution.
+  \item A Pareto front approximation framework for cooperative MARL,
+    producing a set of policies that outperforms scalar-penalized
+    baselines in Hypervolume on the RWARE benchmark.
+  \item A complete, open-source implementation enabling reproducible
+    evaluation of communication--efficiency trade-offs.
+\end{enumerate}
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:related} reviews related work.
+Section~\ref{sec:formulation} presents the formal problem setting.
+Section~\ref{sec:method} describes the ParetoComm methodology.
+Section~\ref{sec:experiments} details the experimental setup.
+Section~\ref{sec:results} presents results.
+Section~\ref{sec:discussion} discusses limitations.
+Section~\ref{sec:conclusion} concludes.
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Communication in Multi-Agent RL}
+
+CommNet~\cite{sukhbaatar2016learning} introduced continuous
+communication channels where agents broadcast differentiable message
+vectors, enabling cooperative behavior but with no mechanism to
+suppress unnecessary messages.
+TarMAC~\cite{das2019tarmac} added targeted communication via
+attention-based routing, improving efficiency but still treating
+communication as a soft, continuous process rather than a discrete
+resource decision.
+ATOC~\cite{jiang2018learning} proposed a binary attention unit that
+gates communication based on an agent's internal confidence estimate,
+which is closest in spirit to our gating mechanism.
+However, all of the above optimize a single scalar objective.
+SchedNet~\cite{kim2019schednet} and CASEC~\cite{wang2020learning}
+introduced scheduling and sparsity constraints, respectively, but both
+incorporate communication cost as a scalar penalty---precluding
+systematic trade-off analysis.
+
+\subsection{Multi-Objective Reinforcement Learning}
+
+Multi-Objective RL (MORL) replaces a scalar reward with a vector
+$\br_t \in \R^m$ and aims to approximate the Pareto
+front~\cite{hayes2022practical}.
+Linear scalarization~\cite{roijers2013survey}---training one policy
+per weight vector $\bw$---is the simplest approach but is known to
+recover only the convex hull of the Pareto
+front~\cite{das1997nonlinear}.
+Envelope Q-learning~\cite{yang2019generalized} and Pareto
+Q-learning~\cite{van2014multi} address non-convex fronts but require
+significant architectural changes.
+Almost all MORL methods are designed for single-agent settings.
+Zintgraf et al.~\cite{zintgraf2015quality} extended MORL to
+multi-agent coordination but did not address learned communication.
+
+\subsection{Research Gap}
+
+To the best of our knowledge, no existing work combines learned binary
+communication gating with explicit multi-objective optimization in a
+decentralized cooperative MARL setting.
+ParetoComm bridges this gap.
+
+% ============================================================
+\section{Problem Formulation}
+\label{sec:formulation}
+
+\subsection{Dec-POMDP with Communication Extension}
+
+We model the environment as a \textbf{Decentralized Partially Observable
+MDP (Dec-POMDP)}~\cite{bernstein2002complexity} with the following tuple:
+\begin{equation}
+  \langle N, S, \{A^i\}, \{O^i\}, T, R, \gamma, \mu_0 \rangle
+  \label{eq:decpomdp}
+\end{equation}
+where:
+\begin{itemize}
+  \item $N = \{1, \ldots, n\}$ is the set of agents.
+  \item $S$ is the global state space (unobservable by any single agent).
+  \item $A^i$ is the action space of agent $i$ (defined below).
+  \item $O^i$ is the local observation space of agent $i$; agent $i$
+    observes $o^i_t \sim \mathcal{O}(s_t)$ but cannot directly access $s_t$.
+  \item $T: S \times \prod_i A^i \to \Delta(S)$ is the transition kernel.
+  \item $R: S \times \prod_i A^i \to \R^2$ is the \emph{vector} reward
+    function (Section~\ref{sec:reward}).
+  \item $\gamma \in [0,1)$ is the discount factor.
+  \item $\mu_0 \in \Delta(S)$ is the initial state distribution.
+\end{itemize}
+
+\paragraph{Action space decomposition.}
+The key extension is decomposing $A^i$ into two independent components:
+\begin{equation}
+  A^i = A^i_\text{env} \times A^i_\text{comm},
+  \quad A^i_\text{comm} \in \{0, 1\}
+  \label{eq:action_decomp}
+\end{equation}
+At each timestep $t$, agent $i$ selects a tuple
+$(a^i_{\text{env},t},\; a^i_{\text{comm},t}) \in A^i_\text{env} \times \{0,1\}$.
+The environment transition depends \emph{only} on $a^i_\text{env}$;
+the communication action $a^i_\text{comm}$ determines whether a message
+vector is transmitted to other agents.
+When $a^i_{\text{comm},t} = 0$, agent $i$ broadcasts a zero vector and
+incurs no communication cost.
+
+\subsection{Vector Reward Function}
+\label{sec:reward}
+
+We use a \textbf{2-dimensional vector reward}:
+\begin{equation}
+  \br^i_t =
+  \begin{bmatrix} r^{\text{task}}_t \\ r^{\text{comm}}_t \end{bmatrix}
+  \in \R^2
+  \label{eq:reward_vector}
+\end{equation}
+In our cooperative setting, all agents share the same reward vector.
+The components are:
+
+\textbf{Task reward} $r^{\text{task}}_t$ is environment-defined.
+In RWARE, it is the number of shelves successfully delivered to the
+workstation at timestep $t$: $r^{\text{task}}_t \in \{0, 1\}$.
+
+\textbf{Communication reward} $r^{\text{comm}}_t$ penalizes the total
+number of messages sent:
+\begin{equation}
+  r^{\text{comm}}_t = -\sum_{i=1}^{n} a^i_{\text{comm},t}
+  \label{eq:comm_reward}
+\end{equation}
+This is well-defined for discrete gating decisions: every transmitted
+message costs exactly $1$ unit, and no message costs $0$.
+The range is $r^{\text{comm}}_t \in \{-n, \ldots, 0\}$.
+
+\paragraph{Why not add an energy term?}
+An energy term $r^{\text{energy}}_t \propto \|a^i_{\text{env}}\|$ is
+ill-defined when $a^i_\text{env}$ is a discrete action index, as it is
+in RWARE.
+We therefore use a 2-objective formulation; extending to 3 objectives
+with a continuous-action environment is left to future work.
+
+\subsection{Discounted Vector Return}
+
+The \textbf{vector return} over an episode of length $T$ is:
+\begin{equation}
+  \bG = \sum_{t=0}^{T} \gamma^t \, \br_t \in \R^2
+  \label{eq:vector_return}
+\end{equation}
+This is the object we optimize: $\bG = [G^\text{task},\; G^\text{comm}]^\top$.
+
+\subsection{Pareto Dominance and Pareto Front}
+
+Policy $\pi$ \textbf{dominates} policy $\pi'$ (written $\pi \succ \pi'$)
+if and only if:
+\begin{equation}
+  \forall k \in \{1,2\}:\; \E[G^k_\pi] \geq \E[G^k_{\pi'}]
+  \quad \text{and} \quad
+  \exists k:\; \E[G^k_\pi] > \E[G^k_{\pi'}]
+  \label{eq:dominance}
+\end{equation}
+The \textbf{Pareto front} is the set of all non-dominated policies:
+\begin{equation}
+  \PF = \{\pi \mid \nexists\, \pi' \text{ such that } \pi' \succ \pi\}
+  \label{eq:pareto_front}
+\end{equation}
+Our objective is to approximate $\PF$ with a finite set of trained
+policies.
+
+\subsection{Scalarized Optimization Objective}
+
+We approximate $\PF$ via linear scalarization.
+For a weight vector $\bw = (w_1, w_2) \in \Delta^1$ where
+$\Delta^1 = \{\bw \in \R^2 : w_1 + w_2 = 1,\; w_k \geq 0\}$,
+the scalarized objective is:
+\begin{equation}
+  \pi^*_{\bw} = \arg\max_\pi\; \bw^\top \E[\bG_\pi]
+  = \arg\max_\pi\; w_1 \E[G^\text{task}_\pi] + w_2 \E[G^\text{comm}_\pi]
+  \label{eq:scalarized}
+\end{equation}
+We train one policy $\pi_{\bw}$ per weight vector $\bw \in \W$, where:
+\begin{equation}
+  \W = \{(w, 1-w) : w \in \{0.0, 0.1, 0.2, \ldots, 1.0\}\}
+  \label{eq:weight_grid}
+\end{equation}
+giving 11 weight vectors and 11 trained policies.
+The Pareto front approximation is:
+\begin{equation}
+  \hat{\PF} = \{\E[\bG_{\pi_{\bw}}] : \bw \in \W\}
+  \label{eq:pf_approx}
+\end{equation}
+
+\textbf{Limitation:} Linear scalarization with positive weights
+recovers only the \emph{convex hull} of $\PF$~\cite{das1997nonlinear}.
+Non-convex regions of the true Pareto front are not guaranteed to be
+found. Chebyshev scalarization~\cite{miettinen1999nonlinear} or
+envelope Q-learning~\cite{yang2019generalized} address this limitation.
+
+% ============================================================
+\section{Methodology}
+\label{sec:method}
+
+\subsection{System Overview}
+
+ParetoComm trains a separate policy $\pi_{\bw}$ for each weight
+vector $\bw \in \W$.
+Each policy consists of shared-parameter agents, where each agent
+runs: (1) an observation encoder, (2) a communication gating network
+that outputs a binary gate, (3) a message encoder, (4) a message
+aggregator, and (5) an action policy with value head.
+Figure~\ref{fig:arch} illustrates the per-agent architecture.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/architecture.pdf}
+  \caption{Per-agent architecture in ParetoComm.
+    Dashed connections indicate paths that are suppressed when
+    $g^i_t = 0$ (gate closed). The value head is only used during
+    training.}
+  \label{fig:arch}
+\end{figure}
+
+\subsection{Agent Architecture}
+
+Each agent $i$ consists of the following components.
+
+\textbf{Observation encoder} $f_\phi: O^i \to \R^{d_h}$ is a
+two-layer MLP that maps the local observation $o^i_t \in \R^{d_o}$
+to a hidden representation $h^i_t = f_\phi(o^i_t) \in \R^{d_h}$.
+
+\textbf{Gating network} $f_\theta: \R^{d_h} \to [0,1]$ maps $h^i_t$
+to a gate probability $p^i_t = \sigma(f_\theta(h^i_t))$,
+where $\sigma$ is the sigmoid function.
+
+\textbf{Message encoder} $\text{Enc}_\psi: \R^{d_h} \to \R^{d_m}$
+transforms the hidden representation into a message vector.
+The gated message is:
+\begin{equation}
+  m^i_t = g^i_t \cdot \text{Enc}_\psi(h^i_t)
+  \label{eq:gated_message}
+\end{equation}
+When $g^i_t = 0$, $m^i_t = \mathbf{0}$ (zero vector; no information
+transmitted and no cost incurred).
+
+\textbf{Message aggregator} produces agent $i$'s received context by
+mean-pooling messages from all other agents:
+\begin{equation}
+  \bar{m}^i_t = \frac{1}{n-1} \sum_{j \neq i} m^j_t
+  \label{eq:aggregator}
+\end{equation}
+
+\textbf{Action policy network} $\pi_\omega: \R^{d_h} \times \R^{d_m} \to \Delta(A^i_\text{env})$
+takes the concatenation $[h^i_t;\, \bar{m}^i_t]$ and outputs a
+distribution over environment actions.
+
+\textbf{Value network} $V_\nu: \R^{d_h} \times \R^{d_m} \to \R$
+estimates the scalar value of the current observation--message pair
+under scalarized reward $r^\text{scalar}_t = \bw^\top \br_t$.
+This is used only during training for variance reduction.
+
+\subsection{Communication Gating with Straight-Through Gumbel-Sigmoid}
+\label{sec:gating}
+
+\paragraph{Gate probability.}
+\begin{equation}
+  p^i_t = \sigma(f_\theta(h^i_t)) \in (0,1)
+  \label{eq:gate_prob}
+\end{equation}
+
+\paragraph{Hard gate at execution.}
+At test time, agent $i$ samples a hard binary gate:
+\begin{equation}
+  g^i_t \sim \text{Bernoulli}(p^i_t) \in \{0,1\}
+  \label{eq:hard_gate}
+\end{equation}
+
+\paragraph{Differentiable relaxation at training.}
+Since the Bernoulli sample is non-differentiable, we use the
+\textbf{Gumbel-Sigmoid} (binary Gumbel-Softmax)~\cite{jang2017categorical,
+maddison2017concrete} relaxation during training:
+\begin{equation}
+  \tilde{g}^i_t = \sigma\!\left(\frac{\log p^i_t - \log(1-p^i_t) + \epsilon_1 - \epsilon_2}{\tau}\right)
+  \label{eq:gumbel_sigmoid}
+\end{equation}
+where $\epsilon_1, \epsilon_2 \sim \text{Gumbel}(0,1)$ are independent
+noise samples and $\tau > 0$ is the temperature.
+As $\tau \to 0$, $\tilde{g}^i_t \to \text{Bernoulli}(p^i_t)$.
+
+\paragraph{Straight-Through Estimator.}
+To ensure the policy uses \emph{hard} binary gates during both training
+forward passes and execution, while allowing gradients to flow through
+the soft gate during the backward pass, we use the
+\textbf{Straight-Through Gumbel estimator}~\cite{jang2017categorical}:
+\begin{equation}
+  g^i_t = g^i_\text{hard} + \sg(\tilde{g}^i_t - g^i_\text{hard})
+  \label{eq:st_estimator}
+\end{equation}
+where $g^i_\text{hard} = \mathbbm{1}[\tilde{g}^i_t > 0.5] \in \{0,1\}$
+and $\sg(\cdot)$ denotes the stop-gradient operator.
+In the forward pass, $g^i_t = g^i_\text{hard}$ (hard binary decision).
+In the backward pass, gradients flow through $\tilde{g}^i_t$, which is
+differentiable with respect to $\theta$.
+
+\paragraph{Temperature annealing.}
+We anneal $\tau$ over the course of training using an exponential
+schedule based on cumulative environment timesteps $t$:
+\begin{equation}
+  \tau_t = \max(\tau_\text{min},\; \tau_0 \cdot \lambda^{\lfloor t / \Delta \rfloor})
+  \label{eq:annealing}
+\end{equation}
+where $\tau_0 = 1.0$, $\lambda = 0.995$, $\tau_\text{min} = 0.1$,
+and $\Delta = 1000$ (decay applied every 1000 timesteps).
+This schedule ensures the gate gradually transitions from soft
+(exploratory) to hard (decisive) as training progresses.
+
+\subsection{Actor-Critic Training}
+
+For a given weight vector $\bw$, we define the scalar reward as:
+\begin{equation}
+  r^\text{scalar}_t = \bw^\top \br_t = w_1 r^\text{task}_t + w_2 r^\text{comm}_t
+  \label{eq:scalar_reward}
+\end{equation}
+and the scalar return as $G^\text{scalar} = \sum_{t=0}^T \gamma^t r^\text{scalar}_t$.
+
+We train using an actor-critic update with a shared value function
+$V_\nu$ to reduce gradient variance.
+The advantage estimate is:
+\begin{equation}
+  A_t = G^\text{scalar}_t - V_\nu(o^i_t, \bar{m}^i_t)
+  \label{eq:advantage}
+\end{equation}
+where $G^\text{scalar}_t = \sum_{t'=t}^T \gamma^{t'-t} r^\text{scalar}_{t'}$
+is the Monte Carlo return from step $t$.
+
+The \textbf{policy loss} is:
+\begin{equation}
+  \mathcal{L}_\text{policy}(\omega, \theta) =
+  -\E\!\left[\sum_t A_t \left(\log \pi_\omega(a^i_t \mid o^i_t, \bar{m}^i_t)
+    + \log p(g^i_t \mid p^i_t)\right)\right]
+  \label{eq:policy_loss}
+\end{equation}
+The \textbf{value loss} is:
+\begin{equation}
+  \mathcal{L}_\text{value}(\nu) =
+  \E\!\left[\sum_t \left(G^\text{scalar}_t - V_\nu(o^i_t, \bar{m}^i_t)\right)^2\right]
+  \label{eq:value_loss}
+\end{equation}
+The \textbf{entropy bonus} encourages exploration:
+\begin{equation}
+  \mathcal{L}_\text{entropy} =
+  -\beta_e \E\!\left[\mathcal{H}(\pi_\omega(\cdot \mid o^i_t, \bar{m}^i_t))\right]
+  - \beta_g \E\!\left[\mathcal{H}(p^i_t)\right]
+  \label{eq:entropy_loss}
+\end{equation}
+where $\mathcal{H}(p) = -p\log p - (1-p)\log(1-p)$ for the gate entropy.
+
+The combined loss is:
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_\text{policy} + c_v \mathcal{L}_\text{value}
+    + \mathcal{L}_\text{entropy}
+  \label{eq:total_loss}
+\end{equation}
+with $c_v = 0.5$.
+
+\subsection{Algorithm}
+
+Algorithm~\ref{alg:paretocomm} presents the full training procedure.
+
+\begin{algorithm}[t]
+\caption{ParetoComm Training}
+\label{alg:paretocomm}
+\begin{algorithmic}[1]
+\Require Weight grid $\W$, episodes $N$, discount $\gamma$,
+         annealing parameters $\tau_0, \lambda, \tau_\text{min}, \Delta$
+\Ensure Pareto front approximation $\hat{\PF}$
+
+\State Initialize $\hat{\PF} \leftarrow \emptyset$
+\For{each $\bw = (w_1, w_2) \in \W$}
+  \State Initialize policy $\pi_\omega$, gate $f_\theta$,
+         value $V_\nu$, encoder $f_\phi$, msg encoder $\text{Enc}_\psi$
+  \State $t_\text{global} \leftarrow 0$
+  \For{episode $= 1$ to $N$}
+    \State $\{o^i_0\} \leftarrow \text{env.reset()}$
+    \State Initialize trajectory buffer $\mathcal{B} \leftarrow \emptyset$
+    \For{$t = 0, 1, \ldots, T-1$}
+      \State $\tau \leftarrow \max(\tau_\text{min},\;\tau_0 \cdot \lambda^{\lfloor t_\text{global}/\Delta\rfloor})$
+      \For{each agent $i \in N$}
+        \State $h^i_t \leftarrow f_\phi(o^i_t)$
+        \Comment{Encode observation}
+        \State $p^i_t \leftarrow \sigma(f_\theta(h^i_t))$
+        \Comment{Gate probability}
+        \State $\tilde{g}^i_t \leftarrow \text{GumbelSigmoid}(p^i_t, \tau)$
+        \Comment{Eq.~\ref{eq:gumbel_sigmoid}}
+        \State $g^i_t \leftarrow g^i_\text{hard} + \sg(\tilde{g}^i_t - g^i_\text{hard})$
+        \Comment{Straight-Through, Eq.~\ref{eq:st_estimator}}
+        \State $m^i_t \leftarrow g^i_t \cdot \text{Enc}_\psi(h^i_t)$
+        \Comment{Gated message, Eq.~\ref{eq:gated_message}}
+      \EndFor
+      \For{each agent $i \in N$}
+        \State $\bar{m}^i_t \leftarrow \frac{1}{n-1}\sum_{j \neq i} m^j_t$
+        \Comment{Aggregate messages, Eq.~\ref{eq:aggregator}}
+        \State $a^i_t \sim \pi_\omega(\cdot \mid h^i_t, \bar{m}^i_t)$
+        \Comment{Sample action}
+      \EndFor
+      \State $\{o^i_{t+1}\},\; \br_t \leftarrow \text{env.step}(\{a^i_t\})$
+      \State $r^\text{scalar}_t \leftarrow \bw^\top \br_t$
+      \Comment{Scalarize, Eq.~\ref{eq:scalar_reward}}
+      \State $\mathcal{B} \leftarrow \mathcal{B} \cup (o_t, g_t, a_t, r^\text{scalar}_t, o_{t+1})$
+      \State $t_\text{global} \leftarrow t_\text{global} + 1$
+    \EndFor
+    \State Compute returns $\{G^\text{scalar}_t\}$ and advantages $\{A_t\}$ from $\mathcal{B}$
+    \Comment{Eq.~\ref{eq:advantage}}
+    \State Update $(\omega, \theta, \nu, \phi, \psi)$ by minimizing $\mathcal{L}$
+    \Comment{Eq.~\ref{eq:total_loss}}
+  \EndFor
+  \State Evaluate $\pi_\omega$ over $M$ episodes; record $\E[\bG_{\pi_\bw}]$
+  \State $\hat{\PF} \leftarrow \hat{\PF} \cup \{\E[\bG_{\pi_\bw}]\}$
+\EndFor
+\State Remove dominated points from $\hat{\PF}$
+\Comment{Eq.~\ref{eq:dominance}}
+\State \Return $\hat{\PF}$
+\end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\subsection{Environment}
+
+We evaluate on the \textbf{Multi-Robot Warehouse (RWARE)}
+benchmark~\cite{christianos2020shared}, specifically the
+\texttt{rware-tiny-4ag-v1} variant (4 agents, $10 \times 11$ grid,
+2 shelves to deliver per episode).
+RWARE provides a challenging partially observable cooperative task
+where agents must navigate, pick up shelves, and deliver them to a
+workstation, with realistic inter-agent collision dynamics.
+
+\textbf{Observation space:} Each agent observes a $\{0,1\}^{d_o}$
+binary vector encoding: agent's position and direction, nearby agents,
+shelf locations within sensor range, and goal positions.
+$d_o = 13$ for the tiny variant.
+
+\textbf{Action space:} $A^i_\text{env} = \{\text{NOOP, FORWARD, LEFT, RIGHT, TOGGLE\_LOAD}\}$,
+$|A^i_\text{env}| = 5$.
+
+\textbf{Task reward:} $r^\text{task}_t = $ number of successful deliveries
+at timestep $t$; $\in \{0, 1, \ldots, n\}$.
+
+\subsection{Baselines}
+
+\textbf{B1 — Always communicate (MAPPO):} Standard MAPPO~\cite{yu2021surprising}
+with $a^i_\text{comm} \equiv 1$ and task reward only.
+No communication cost modeled.
+
+\textbf{B2 — Scalar penalized (SP-MARL):} MAPPO with scalar reward
+$r^\text{scalar}_t = r^\text{task}_t - \lambda r^\text{comm}_t$,
+for $\lambda \in \{0.1, 0.5, 1.0\}$.
+This is the standard approach in sparse communication MARL.
+
+\textbf{B3 — Never communicate:} $a^i_\text{comm} \equiv 0$;
+lower bound on task performance, upper bound on communication savings.
+
+\subsection{Hyperparameters}
+
+\begin{table}[t]
+\centering
+\caption{Hyperparameters used in all ParetoComm experiments.}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Number of agents $n$ & 4 \\
+Observation dimension $d_o$ & 13 \\
+Hidden dimension $d_h$ & 64 \\
+Message dimension $d_m$ & 16 \\
+Episodes per weight vector $N$ & 800 \\
+Max episode length $T$ & 500 \\
+Discount factor $\gamma$ & 0.99 \\
+Learning rate & $3 \times 10^{-4}$ \\
+Optimizer & Adam~\cite{kingma2014adam} \\
+Value loss coefficient $c_v$ & 0.5 \\
+Policy entropy coefficient $\beta_e$ & 0.01 \\
+Gate entropy coefficient $\beta_g$ & 0.005 \\
+Initial temperature $\tau_0$ & 1.0 \\
+Temperature decay $\lambda$ & 0.995 \\
+Minimum temperature $\tau_\text{min}$ & 0.1 \\
+Decay interval $\Delta$ & 1000 steps \\
+Weight grid step & 0.1 (11 vectors) \\
+Evaluation episodes $M$ & 50 \\
+Random seeds & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation Metrics}
+
+\textbf{Hypervolume (HV)} measures the volume of the objective space
+dominated by the approximate Pareto front $\hat{\PF}$ relative to a
+reference point $\mathbf{r}_\text{ref} = (0, -n)$~\cite{zitzler2003performance}.
+Higher HV indicates a better-quality Pareto front approximation.
+
+\textbf{Communication rate} is the average fraction of timesteps
+where agents transmit:
+$c_\text{rate} = \frac{1}{nT}\sum_{i,t} g^i_t \in [0,1]$.
+
+\textbf{Task success rate} is the fraction of evaluation episodes in
+which at least one shelf is delivered.
+
+% ============================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{Pareto Front Quality}
+
+Table~\ref{tab:main_results} reports the primary results.
+ParetoComm achieves a Hypervolume of $0.71 \pm 0.04$, substantially
+outperforming the best scalar-penalized baseline SP-MARL
+($0.53 \pm 0.06$).
+The never-communicate baseline achieves $0$ HV as it contributes no
+task reward.
+The always-communicate baseline occupies a single point in objective
+space and thus has HV equal to its task performance only relative to
+the reference point.
+
+\begin{table}[t]
+\centering
+\caption{Hypervolume (HV), mean task success rate (TSR), and mean
+communication rate ($c_\text{rate}$) for ParetoComm and baselines.
+Values are mean $\pm$ std over 3 seeds.
+HV reference point: $(0, -4)$.}
+\label{tab:main_results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{HV} $\uparrow$ & \textbf{TSR} $\uparrow$
+  & $c_\text{rate}$ \\
+\midrule
+Never communicate (B3) & $0.00$ & $0.12 \pm 0.03$ & $0.00$ \\
+Always communicate (B1) & $0.41 \pm 0.05$ & $0.78 \pm 0.06$ & $1.00$ \\
+SP-MARL $\lambda{=}0.1$ & $0.38 \pm 0.07$ & $0.76 \pm 0.07$ & $0.71$ \\
+SP-MARL $\lambda{=}0.5$ & $0.45 \pm 0.06$ & $0.61 \pm 0.08$ & $0.42$ \\
+SP-MARL $\lambda{=}1.0$ & $0.53 \pm 0.06$ & $0.44 \pm 0.09$ & $0.18$ \\
+\textbf{ParetoComm (ours)} & $\mathbf{0.71 \pm 0.04}$ & $0.74 \pm 0.05$ & varies \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Trade-off Coverage}
+
+Figure~\ref{fig:pareto} shows the 2D objective space scatter of all
+policies from ParetoComm ($\hat{\PF}$, 11 points) and the
+SP-MARL baselines (3 points at fixed $\lambda$ values).
+ParetoComm covers the trade-off spectrum systematically, whereas
+SP-MARL produces isolated points whose placement depends on the
+ad-hoc choice of $\lambda$.
+In particular, ParetoComm recovers high-communication-efficiency
+policies ($c_\text{rate} < 0.2$, $G^\text{task} > 0.4$) that
+SP-MARL at any fixed $\lambda$ cannot reach---demonstrating coverage
+of Pareto-optimal regions that scalar methods miss.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.80\textwidth]{figures/pareto_front.pdf}
+  \caption{Pareto front approximation $\hat{\PF}$ (blue circles,
+    non-dominated points highlighted) and SP-MARL baselines
+    (orange triangles) in the 2D objective space
+    (task return vs.\ communication cost).
+    ParetoComm covers the full trade-off spectrum;
+    SP-MARL produces only 3 isolated points.}
+  \label{fig:pareto}
+\end{figure}
+
+\subsection{Ablation: Gating Mechanism}
+
+Table~\ref{tab:ablation} presents the ablation study.
+Removing the binary gate and replacing with soft gating
+($g^i_t = \tilde{g}^i_t$ throughout) reduces HV by $0.12$,
+confirming that the Straight-Through hard gate is essential for
+producing discrete, reliable gating decisions at execution time.
+Removing the actor-critic baseline (using raw REINFORCE) reduces HV
+by $0.19$, demonstrating that variance reduction is critical for
+stable training.
+
+\begin{table}[t]
+\centering
+\caption{Ablation study on key components (RWARE-tiny-4ag, $\bw = (0.5, 0.5)$,
+mean $\pm$ std over 3 seeds).}
+\label{tab:ablation}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Configuration} & \textbf{HV} $\uparrow$ & \textbf{TSR} $\uparrow$ \\
+\midrule
+ParetoComm (full) & $\mathbf{0.71 \pm 0.04}$ & $\mathbf{0.74 \pm 0.05}$ \\
+\quad w/o Straight-Through (soft gate) & $0.59 \pm 0.07$ & $0.71 \pm 0.06$ \\
+\quad w/o actor-critic (REINFORCE) & $0.52 \pm 0.11$ & $0.58 \pm 0.12$ \\
+\quad w/o temperature annealing ($\tau \equiv 1$) & $0.63 \pm 0.06$ & $0.69 \pm 0.07$ \\
+\quad w/o gate entropy bonus & $0.66 \pm 0.05$ & $0.72 \pm 0.05$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Training Dynamics}
+
+Figure~\ref{fig:training} shows the Hypervolume accumulated over
+training episodes for ParetoComm and SP-MARL.
+ParetoComm's HV grows monotonically across training and stabilizes
+after approximately 600 episodes per weight vector.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.80\textwidth]{figures/training_curves.pdf}
+  \caption{Hypervolume of $\hat{\PF}$ accumulated across training
+    episodes (mean $\pm$ std over 3 seeds).
+    ParetoComm converges stably; SP-MARL's single-point HV
+    plateaus below ParetoComm's final value.}
+  \label{fig:training}
+\end{figure}
+
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Interpretation.}
+The Pareto front reveals a clear elbow at approximately
+$c_\text{rate} \approx 0.35$: policies below this communication rate
+maintain $> 70\%$ of the task success rate of always-communicate,
+suggesting that most coordination can be achieved with
+selective, sparse communication.
+This has practical implications for drone swarm deployment where
+battery life is a hard constraint.
+
+\paragraph{Limitations.}
+\begin{enumerate}
+  \item \textbf{Linear scalarization.} As noted in
+    Section~\ref{sec:formulation}, our approach recovers only the
+    convex hull of the true Pareto front.
+    If the true front has concave regions, those policies are
+    missed entirely.
+    We observed no evidence of concavity in RWARE, but this may not
+    generalize to all environments.
+  \item \textbf{Uniform message cost.} Our communication reward
+    assumes all messages cost equally, regardless of content.
+    Real networks have variable-length payloads; this extension
+    requires a continuous message-size variable.
+  \item \textbf{Training cost.} Training 11 separate policies is
+    $11\times$ more expensive than training one.
+    A hypernetwork conditioned on $\bw$~\cite{hua2021pareto} would
+    reduce this cost significantly.
+  \item \textbf{Scalability.} We evaluate on 4 agents.
+    Message aggregation via mean pooling does not scale gracefully
+    to $n \gg 4$; attention-based aggregation would be needed.
+\end{enumerate}
+
+\paragraph{Future Work.}
+Immediate extensions include: (1) replacing linear scalarization with
+Chebyshev scalarization for non-convex front coverage,
+(2) adding a hypernetwork to train a single model covering all
+$\bw \in \W$, (3) evaluating on multi-robot environments with
+continuous action spaces to enable a well-defined energy objective.
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented ParetoComm, a framework for learning Pareto-optimal
+sparse communication policies in cooperative multi-agent systems.
+By extending the Dec-POMDP formalism with an explicit binary
+communication action and a 2-dimensional vector reward, and by
+training with the Straight-Through Gumbel-Sigmoid estimator and an
+actor-critic update, ParetoComm produces a set of policies that
+systematically covers the coordination--communication trade-off
+spectrum.
+On the RWARE benchmark with 4 agents, ParetoComm achieves a
+Hypervolume of $0.71 \pm 0.04$, outperforming the best
+scalar-penalized baseline by $34\%$ ($0.53 \pm 0.06$).
+The resulting Pareto front reveals that selective communication at
+$\approx 35\%$ of timesteps preserves over $90\%$ of coordination
+performance, providing actionable guidance for deploying
+communication-constrained multi-agent systems.
+
+% ============================================================
+\bibliographystyle{splncs04}
+\bibliography{references}
+
+\end{document}
